@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     CHAT_MODEL: str = "openai/gpt-4o-mini"      # answers, routing, rewriting
     VISION_MODEL: str = "openai/gpt-4o"         # reads charts/tables at ingestion
     EMBEDDING_MODEL: str = "openai/text-embedding-3-large"
-    EMBEDDING_DIMENSIONS: int = 3072
+    EMBEDDING_DIMENSIONS: int = 1536
 
     """AI Search (Vector Store)"""
     SEARCH_ENDPOINT: str = ""
@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "change-me"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+
+    """Azure OpenAI"""
+    AZURE_OPENAI_ENDPOINT: str = ""
+    AZURE_OPENAI_API_KEY: str = ""
+    AZURE_OPENAI_CHAT_DEPLOYMENT: str = ""       # your gpt-4.1-mini deployment name
+    AZURE_OPENAI_VISION_DEPLOYMENT: str = ""     # empty = use the chat deployment
+    AZURE_OPENAI_EMBEDDING_DEPLOYMENT: str = ""
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

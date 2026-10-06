@@ -1,9 +1,10 @@
 import asyncio
+import json
 import re
 from functools import lru_cache
 from pathlib import Path
 
-from app.adapters.llm.openrouter_client import openrouter_client
+from app.adapters.llm.azure_openai_client import azure_openai_client
 from app.adapters.logger import logger
 from app.adapters.pdf.pdf_parser import pdf_parser
 from app.adapters.search.ai_search_client import ai_search_client
@@ -20,7 +21,7 @@ class IngestionService:
         self.settings = settings
         self.parser = pdf_parser
         self.chunker = chunker
-        self.llm = openrouter_client
+        self.llm = azure_openai_client
         self.search = ai_search_client
         self.chart_template = get_prompt_template("chart_reading.jinja2")
 
@@ -79,7 +80,7 @@ class IngestionService:
             description, doc_name, doc_label, report_year, pdf_page, figure["caption"]
         )
 
-    async def _chart_chunks(self, pdf_path, pages, doc_name, doc_label, report_year) -> list[dict]:
+    async def _chart_chunks(self, pdf_path, pages, doc_name, doc_label, report_year) -> tuple[list[dict], int]:
         figures = self.chunker.find_figure_pages(pages)
         logger.info(f"{doc_name}: reading {len(figures)} chart pages with the vision model")
 
@@ -96,20 +97,39 @@ class IngestionService:
         failed = len(figures) - len(chunks)
         if failed:
             logger.warning(f"{doc_name}: {failed} chart pages failed, run again to retry")
-        return chunks
+        return chunks, failed
 
     # ---------- Main steps ----------
 
-    async def ingest_pdf(self, pdf_path: Path) -> int:
-        """Ingest one PDF. Returns the number of chunks uploaded."""
-        doc_name, doc_label, report_year = self._describe(pdf_path)
-        logger.info(f"Ingesting {doc_name} ({doc_label}, {report_year})")
-
+    async def _build_chunks(self, pdf_path, doc_name, doc_label, report_year):
+        """Read the PDF and build all chunks. Returns (chunks, number of failed chart pages)."""
         pages = await self.parser.extract_pages(pdf_path)
 
         chunks = self.chunker.chunk_text_pages(pages, doc_name, doc_label, report_year)
         chunks += await self._table_chunks(pdf_path, doc_name, doc_label, report_year)
-        chunks += await self._chart_chunks(pdf_path, pages, doc_name, doc_label, report_year)
+        chart_chunks, failed = await self._chart_chunks(
+            pdf_path, pages, doc_name, doc_label, report_year
+        )
+        return chunks + chart_chunks, failed
+
+    async def ingest_pdf(self, pdf_path: Path, use_cache: bool = True) -> int:
+        """Ingest one PDF. Returns the number of chunks uploaded."""
+        doc_name, doc_label, report_year = self._describe(pdf_path)
+        logger.info(f"Ingesting {doc_name} ({doc_label}, {report_year})")
+
+        # Chunks (without vectors) are saved here, so a re-run skips the slow steps
+        cache_file = self.settings.DATA_DIR / "chunks" / f"{doc_name}.json"
+
+        if use_cache and cache_file.exists():
+            chunks = json.loads(cache_file.read_text(encoding="utf-8"))
+            logger.info(f"{doc_name}: loaded {len(chunks)} chunks from cache")
+        else:
+            chunks, failed = await self._build_chunks(pdf_path, doc_name, doc_label, report_year)
+            if failed == 0:  # never save an incomplete result
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+            else:
+                logger.warning(f"{doc_name}: not cached because {failed} chart pages failed")
 
         vectors = await self.llm.embed([chunk["content"] for chunk in chunks])
         if len(vectors) != len(chunks):
@@ -125,7 +145,7 @@ class IngestionService:
         logger.info(f"Done {doc_name}: {len(chunks)} chunks {counts}")
         return len(chunks)
 
-    async def ingest_all(self, reset: bool = False) -> int:
+    async def ingest_all(self, reset: bool = False, use_cache: bool = True) -> int:
         """Ingest every PDF in the PDFs folder. reset=True starts with an empty index."""
         pdf_files = sorted(self.settings.PDF_DIR.glob("*.pdf"))
         if not pdf_files:
@@ -142,7 +162,7 @@ class IngestionService:
 
         total = 0
         for pdf_path in pdf_files:
-            total += await self.ingest_pdf(pdf_path)
+            total += await self.ingest_pdf(pdf_path, use_cache)
 
         logger.info(f"Ingestion finished: {total} chunks from {len(pdf_files)} PDFs")
         return total

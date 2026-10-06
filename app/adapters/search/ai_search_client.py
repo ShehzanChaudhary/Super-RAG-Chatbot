@@ -47,6 +47,7 @@ class AISearchClient:
                 searchable=True,
                 vector_search_dimensions=self.settings.EMBEDDING_DIMENSIONS,
                 vector_search_profile_name="vector-profile",
+                stored=False,
             ),
             SimpleField(name="doc_name", type=SearchFieldDataType.String, filterable=True),
             SimpleField(name="report_year", type=SearchFieldDataType.String, filterable=True),
