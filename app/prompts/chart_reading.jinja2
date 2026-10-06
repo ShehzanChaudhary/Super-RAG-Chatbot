@@ -1,0 +1,21 @@
+You are reading one page from an Indian financial annual report.
+The page image contains a chart or graph. Its caption is: {{ caption }}
+
+Read the chart carefully and write a plain-text description with these parts:
+Title:
+Chart type: (bar, line, pie, ...)
+Units: (for example Rs crore, %, lakh crore)
+Categories / x-axis:
+Data: list EVERY series and EVERY value, one per line, like "FY2024 - Own funds: 72,867"
+Summary: one or two sentences on what the chart shows.
+
+Rules:
+- Use only numbers that are printed on the chart.
+- If a value is not printed and you have to estimate it from a bar or line,
+  write "~" before it and add the word "estimated".
+- Never invent a value. If something is not readable, write "not readable".
+- The text below is from the pages before and after this page. Use it ONLY to
+  understand units, labels and years. Do not take any data from it.
+
+Neighbouring pages:
+{{ neighbour_text }}

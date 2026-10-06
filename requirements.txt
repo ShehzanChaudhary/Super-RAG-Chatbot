@@ -1,0 +1,6 @@
+pydantic-settings
+openai
+azure-search-documents 
+aiohttp
+pymupdf
+jinja2
