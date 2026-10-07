@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     SEARCH_API_KEY: str = ""
     SEARCH_INDEX_NAME: str = "rag-assistant-bot"
 
+    """Retrieval"""
+    RETRIEVAL_TOP_K: int = 8
+    RETRIEVAL_TABLE_K: int = 4
+    RETRIEVAL_CHART_K: int = 3
+    RETRIEVAL_HISTORY_MESSAGES: int = 6
+
+    """Answer"""
+    ANSWER_MAX_TOKENS: int = 1500
+    DOCUMENTS_URL: str = "/api/documents"
+
     """Database"""
     DATABASE_URL: str = "sqlite+aiosqlite:///./rag_bot.db"
 
@@ -36,6 +46,9 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "change-me"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+
+    """CORS (browser origins allowed to call this API)"""
+    CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
     """Azure OpenAI"""
     AZURE_OPENAI_ENDPOINT: str = ""

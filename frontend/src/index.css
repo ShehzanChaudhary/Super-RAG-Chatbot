@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-navy: #173a66;
+  --color-brand-maroon: #9e2a2b;
+  --color-brand-maroon-dark: #831f21;
+  --color-brand-sky: #f5f8fd;
+  --color-brand-blue: #2d8cf0;
+  --color-brand-text: #4a4a4a;
+
+  --font-sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+}
+
+@layer base {
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    color: var(--color-brand-text);
+    background: #ffffff;
+  }
+}

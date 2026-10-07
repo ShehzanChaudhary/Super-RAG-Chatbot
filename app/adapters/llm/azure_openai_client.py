@@ -1,6 +1,7 @@
 import base64
 
 from openai import AsyncOpenAI
+from collections.abc import AsyncIterator
 
 from app.adapters.logger.logger import logger
 from app.core.config import settings
@@ -21,7 +22,6 @@ class AzureOpenAIClient:
         self,
         messages: list[dict],
         deployment: str | None = None,
-        temperature: float = 0.0,
         json_mode: bool = False,
         max_tokens: int | None = None,
     ) -> str:
@@ -32,18 +32,48 @@ class AzureOpenAIClient:
         if json_mode:
             extra["response_format"] = {"type": "json_object"}
         if max_tokens:
-            extra["max_tokens"] = max_tokens
+            extra["max_completion_tokens"] = max_tokens
 
         try:
             response = await self.client.chat.completions.create(
                 model=deployment,  # in Azure, "model" means the deployment name
                 messages=messages,
-                temperature=temperature,
                 **extra,
             )
             return response.choices[0].message.content or ""
         except Exception as e:
             logger.error(f"Chat call failed (deployment={deployment}): {e}")
+            raise
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        deployment: str | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Send messages to a chat deployment and yield the reply piece by piece."""
+        deployment = deployment or settings.AZURE_OPENAI_CHAT_DEPLOYMENT
+
+        extra = {}
+        if max_tokens:
+            extra["max_completion_tokens"] = max_tokens
+
+        try:
+            stream = await self.client.chat.completions.create(
+                model=deployment,
+                messages=messages,
+                stream=True,
+                **extra,
+            )
+            async for event in stream:
+                # Some events have no choices (for example Azure's first event)
+                if not event.choices:
+                    continue
+                piece = event.choices[0].delta.content
+                if piece:
+                    yield piece
+        except Exception as e:
+            logger.error(f"Chat stream failed (deployment={deployment}): {e}")
             raise
 
     async def vision(
@@ -63,6 +93,7 @@ class AzureOpenAIClient:
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        "detail": "high"
                     },
                 ],
             }

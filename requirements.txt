@@ -4,3 +4,11 @@ azure-search-documents
 aiohttp
 pymupdf
 jinja2
+fastapi
+uvicorn[standard]
+sqlalchemy
+aiosqlite
+pyjwt
+bcrypt
+email-validator
+sqlalchemy[asyncio]

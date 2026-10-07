@@ -8,7 +8,17 @@ Units: (for example Rs crore, %, lakh crore)
 Categories / x-axis:
 Data: list EVERY series and EVERY value, one per line, like "FY2024 - Own funds: 72,867"
 Summary: one or two sentences on what the chart shows.
+{% if page_numbers %}
+Numbers printed on this page (taken from the PDF itself, so they are exact).
+They are separated by " | ", because the numbers themselves contain commas:
+{{ page_numbers }}
 
+- Every one of these numbers that belongs to the chart must appear in the Data part,
+  next to its own label.
+- A number printed above or below a bar belongs to the thin segment it points to.
+  Match each segment to the legend by its colour.
+- Never write a number that is not in this list.
+{% endif %}
 Rules:
 - Use only numbers that are printed on the chart.
 - If a value is not printed and you have to estimate it from a bar or line,
