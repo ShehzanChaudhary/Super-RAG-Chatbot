@@ -58,6 +58,7 @@ class AnswerService:
 
         # LLM wrote nothing before the SOURCES line
         if not answer_text:
+            logger.warning(f"Empty answer from LLM, raw buffer: {buffer!r}")
             yield {"type": "token", "text": NOT_FOUND_MESSAGE}
             yield self._done(False, True, NOT_FOUND_MESSAGE, [])
             return
@@ -125,20 +126,19 @@ class AnswerService:
                 continue
 
             chunk = chunks[number - 1]
-            key = (chunk["doc_name"], chunk["pdf_page"])
+            key = (chunk["source_pdf"], chunk["page_start"], chunk["page_end"])
             if key in seen:
                 continue
             seen.add(key)
 
             citations.append(
                 {
-                    "doc_name": chunk["doc_name"],
-                    "pdf_page": chunk["pdf_page"],
-                    "report_year": chunk["report_year"],
-                    "chunk_type": chunk["chunk_type"],
+                    "doc_name": chunk["source_pdf"],
+                    "pdf_page": chunk["page_start"],
+                    "page_end": chunk["page_end"],
                     "url": (
-                        f"{settings.DOCUMENTS_URL}/{quote(chunk['doc_name'])}"
-                        f"#page={chunk['pdf_page']}"
+                        f"{settings.DOCUMENTS_URL}/{quote(chunk['source_pdf'])}"
+                        f"#page={chunk['page_start']}"
                     ),
                 }
             )

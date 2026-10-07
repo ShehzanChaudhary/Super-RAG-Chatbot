@@ -12,3 +12,7 @@ pyjwt
 bcrypt
 email-validator
 sqlalchemy[asyncio]
+azure-ai-documentintelligence
+pypdf
+Pillow
+tiktoken

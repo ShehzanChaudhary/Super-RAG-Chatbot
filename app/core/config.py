@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     RETRIEVAL_CHART_K: int = 3
     RETRIEVAL_HISTORY_MESSAGES: int = 6
 
+    REPORT_FILES: list[str] = [
+    "Annual_Report_2021_22_1.pdf",
+    "Annual_Report_2022_23.pdf",
+    "Annual_Report_2023_24.pdf",
+    ]
+    RETRIEVAL_PER_REPORT_K: int = 4
+    REWRITE_MAX_TOKENS: int = 800
+
     """Answer"""
     ANSWER_MAX_TOKENS: int = 1500
     DOCUMENTS_URL: str = "/api/documents"
