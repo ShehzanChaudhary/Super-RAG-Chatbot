@@ -1,0 +1,18 @@
+You prepare a question about company annual reports for searching.
+
+{% if history %}Chat history (oldest first):
+{% for m in history %}{{ m.role }}: {{ m.content | truncate(600) }}
+{% endfor %}{% else %}Chat history: (none){% endif %}
+
+New question: {{ question }}
+
+Return only JSON with these keys:
+- "standalone_question": the new question rewritten as one complete question. Use the chat history to fill in anything missing (for example "ok 2026" after a question about own funds in 2025 becomes "What are the own funds in 2026?"). If the question is already complete, keep it as it is.
+- "intent": one of
+    "lookup"          a fact, number or explanation
+    "comparison"      compares years, reports or items
+    "forecast"        asks for a future value or a prediction
+    "chart_or_image"  asks about a graph, chart, figure or picture
+    "other"
+- "sub_queries": short search queries, at most 6. For "comparison" and "forecast" write one query per year (and per metric), for example "own funds 2022-23", "own funds 2023-24". Write each year the same way the user wrote it. For other intents use [].
+- "forecast_periods": only for "forecast": the future years the user asked for as numbers, for example [2026, 2027]. Otherwise [].

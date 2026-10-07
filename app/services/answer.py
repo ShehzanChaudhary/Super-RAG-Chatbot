@@ -1,157 +1,140 @@
+import json
 import re
-from collections.abc import AsyncIterator
-from urllib.parse import quote
 
 from app.adapters.llm.azure_openai_client import azure_openai_client
 from app.adapters.logger.logger import logger
 from app.core.config import settings
 from app.prompts import get_prompt_template
+from app.services import forecaster, verifier
+from app.services.page_store import page_store
+from app.services.retriever import retriever
 
-NOT_FOUND_MESSAGE = "Ye jawab mujhe reports me nahi mila."
-ERROR_MESSAGE = "Jawab banate waqt error aaya. Dobara try karo."
-MARKER = "SOURCES:"
+IMAGE_FILE_RE = re.compile(r"\s+file=\S+")
 
 
 class AnswerService:
-    """Builds the final answer from retrieved chunks, streams it, and adds citations."""
+    """Retrieve, write the answer from the pages only, check it, and add projections."""
 
     def __init__(self):
-        self.answer_prompt = get_prompt_template("answer.jinja2")
+        self.answer_prompt = get_prompt_template("answer_generation.jinja2")
 
-    async def answer_stream(self, question: str, chunks: list[dict]) -> AsyncIterator[dict]:
-        """
-        Yield events:
-          {"type": "token", "text": "..."}   a piece of the answer, show it right away
-          {"type": "done", "found", "verified", "answer", "citations"}   the last event
-          {"type": "error", "message": "..."}   something broke
-        """
-        # Nothing retrieved: do not call the LLM at all
-        if not chunks:
-            yield {"type": "token", "text": NOT_FOUND_MESSAGE}
-            yield self._done(False, True, NOT_FOUND_MESSAGE, [])
-            return
+    async def answer(self, question: str, history: list[dict] | None = None) -> dict:
+        history = history or []
+        context = await retriever.retrieve(question, history)
+        pages = context["pages"]
+        analysis = context["analysis"]
 
-        prompt = self.answer_prompt.render(question=question, chunks=chunks)
+        if not pages:
+            return self._not_found(context["question"], analysis["intent"], "No matching pages were found.")
 
-        buffer = ""  # everything the LLM wrote so far
-        sent = 0     # how many characters of the buffer the user has already got
+        result = await self._generate(context, history)
+        if not result:
+            return self._not_found(context["question"], analysis["intent"], "The answer could not be produced.")
 
-        try:
-            async for piece in azure_openai_client.chat_stream(
-                [{"role": "user", "content": prompt}],
-                max_tokens=settings.ANSWER_MAX_TOKENS,
-            ):
-                buffer += piece
-                safe = self._safe_length(buffer)
-                if safe > sent:
-                    yield {"type": "token", "text": buffer[sent:safe]}
-                    sent = safe
-        except Exception as e:
-            logger.error(f"Answer stream failed: {e}")
-            yield {"type": "error", "message": ERROR_MESSAGE}
-            return
-
-        answer_text, sources_text, marker_index = self._split_sources(buffer)
-
-        if marker_index != -1 and sent > marker_index:
-            logger.warning("The SOURCES line was shown to the user")
-
-        # LLM wrote nothing before the SOURCES line
-        if not answer_text:
-            logger.warning(f"Empty answer from LLM, raw buffer: {buffer!r}")
-            yield {"type": "token", "text": NOT_FOUND_MESSAGE}
-            yield self._done(False, True, NOT_FOUND_MESSAGE, [])
-            return
-
-        # No SOURCES line at all: the answer cannot be verified
-        if sources_text is None:
-            logger.warning("Answer had no SOURCES line")
-            yield self._done(True, False, answer_text, [])
-            return
-
-        # LLM says the answer is not in the reports
-        if sources_text.strip().lower() == "none":
-            logger.info("LLM said the answer is not in the sources")
-            yield self._done(False, True, answer_text, [])
-            return
-
-        numbers = [int(n) for n in re.findall(r"\d+", sources_text)]
-        citations = self._build_citations(numbers, chunks)
-
-        # Answer shown, but none of its sources is valid
-        if not citations:
-            logger.warning(f"Answer had no valid sources: {sources_text}")
-            yield self._done(True, False, answer_text, [])
-            return
-
-        yield self._done(True, True, answer_text, citations)
-
-    async def answer(self, question: str, chunks: list[dict]) -> dict:
-        """Same as answer_stream, but waits and returns only the final result."""
-        async for event in self.answer_stream(question, chunks):
-            if event["type"] == "done":
-                return event
-            if event["type"] == "error":
+        # Check the answer against the pages; if something is wrong, let the model fix it
+        problems = verifier.verify(result, pages)
+        for attempt in range(settings.VERIFY_MAX_REPAIRS):
+            if not problems:
                 break
-        return self._done(False, False, NOT_FOUND_MESSAGE, [])
+            logger.warning(f"Verification problems (repair {attempt + 1}): {problems}")
+            repaired = await self._generate(context, history, feedback="\n".join(problems[:15]))
+            if not repaired:
+                break
+            result = repaired
+            problems = verifier.verify(result, pages)
 
-    def _safe_length(self, buffer: str) -> int:
-        """How many characters at the start of the buffer are safe to show the user."""
-        # The SOURCES marker always starts a new line, so only the current
-        # (last) line can be the marker. Hold it back while it still looks like one.
-        line_start = buffer.rfind("\n") + 1
-        current_line = buffer[line_start:].lstrip()
-        if MARKER.startswith(current_line) or current_line.startswith(MARKER):
-            return line_start
-        return len(buffer)
+        tables = result.get("tables", [])
+        chart = result.get("chart")
+        warnings = [f"Could not verify: {p}" for p in problems]
 
-    def _split_sources(self, full_text: str) -> tuple[str, str | None, int]:
-        """Split the reply into (answer, text after SOURCES:, marker position)."""
-        index = full_text.rfind(MARKER)
-        if index == -1:
-            return full_text.strip(), None, -1
-        answer = full_text[:index].strip()
-        sources = full_text[index + len(MARKER):].strip()
-        return answer, sources, index
+        # Projections are calculated in code from the verified historical numbers
+        if analysis["intent"] == "forecast" and result.get("series_for_forecast"):
+            f_tables, f_chart, f_warnings = forecaster.project(
+                result["series_for_forecast"], analysis["forecast_periods"]
+            )
+            tables = tables + f_tables
+            chart = f_chart or chart
+            warnings += f_warnings
 
-    def _build_citations(self, source_numbers: list, chunks: list[dict]) -> list[dict]:
-        """Convert the source numbers from the LLM into clickable citations."""
-        citations = []
-        seen = set()
+        return {
+            "question": context["question"],
+            "intent": analysis["intent"],
+            "answer": result.get("answer", ""),
+            "not_found": bool(result.get("not_found", False)),
+            "tables": tables,
+            "chart": chart,
+            "citations": self._build_citations(result.get("citations", [])),
+            "images": self._build_images(result.get("image_ids", []), pages),
+            "warnings": warnings,
+        }
 
-        for number in source_numbers:
-            # Source numbers start at 1, so chunk index = number - 1
-            if not isinstance(number, int) or not 1 <= number <= len(chunks):
-                logger.warning(f"Ignoring invalid source number: {number}")
-                continue
+    async def _generate(self, context: dict, history: list[dict], feedback: str = "") -> dict:
+        pages = [
+            {**p, "text": IMAGE_FILE_RE.sub("", p["text"])} for p in context["pages"]
+        ]
+        prompt = self.answer_prompt.render(
+            question=context["question"],
+            intent=context["analysis"]["intent"],
+            history=history[-settings.RETRIEVAL_HISTORY_MESSAGES :],
+            pages=pages,
+            feedback=feedback,
+        )
+        reply = ""
+        try:
+            reply = await azure_openai_client.chat(
+                [{"role": "user", "content": prompt}],
+                json_mode=True,
+                max_tokens=settings.ANSWER_MAX_TOKENS,
+            )
+            return json.loads(reply)
+        except Exception as e:
+            logger.error(f"Answer generation failed ({e}), raw reply: {reply[:500]!r}")
+            return {}
 
-            chunk = chunks[number - 1]
-            key = (chunk["source_pdf"], chunk["page_start"], chunk["page_end"])
+    def _build_citations(self, citations: list[dict]) -> list[dict]:
+        base = settings.PDF_BASE_URL.rstrip("/")
+        out, seen = [], set()
+        for c in citations:
+            key = (c.get("source_pdf"), c.get("page"))
             if key in seen:
                 continue
             seen.add(key)
-
-            citations.append(
+            out.append(
                 {
-                    "doc_name": chunk["source_pdf"],
-                    "pdf_page": chunk["page_start"],
-                    "page_end": chunk["page_end"],
-                    "url": (
-                        f"{settings.DOCUMENTS_URL}/{quote(chunk['source_pdf'])}"
-                        f"#page={chunk['page_start']}"
-                    ),
+                    "source_pdf": c["source_pdf"],
+                    "page": c["page"],
+                    "evidence": c.get("evidence", ""),
+                    "url": f"{base}/{c['source_pdf']}#page={c['page']}",
                 }
             )
+        return out
 
-        return citations
+    def _build_images(self, image_ids: list[str], pages: list[dict]) -> list[dict]:
+        records = page_store.images()
+        prefix = settings.IMAGE_URL_PREFIX.rstrip("/")
+        return [
+            {
+                "image_id": i,
+                "url": f"{prefix}/{i}",
+                "source_pdf": records[i]["source_pdf"],
+                "page": records[i]["page_number"],
+                "description": records[i]["description"],
+            }
+            for i in image_ids
+            if i in records
+        ]
 
-    def _done(self, found: bool, verified: bool, answer: str, citations: list[dict]) -> dict:
+    def _not_found(self, question: str, intent: str, reason: str) -> dict:
         return {
-            "type": "done",
-            "found": found,
-            "verified": verified,
-            "answer": answer,
-            "citations": citations,
+            "question": question,
+            "intent": intent,
+            "answer": reason,
+            "not_found": True,
+            "tables": [],
+            "chart": None,
+            "citations": [],
+            "images": [],
+            "warnings": [],
         }
 
 

@@ -7,27 +7,32 @@ from app.adapters.logger.logger import logger
 from app.adapters.search.ai_search_client import ai_search_client
 from app.core.config import settings
 from app.prompts import get_prompt_template
+from app.services.page_store import page_store
 
 # "2023-24" or "2023/24": a financial year written as a range
 YEAR_RANGE_RE = re.compile(r"(?<!\d)(20\d{2})\s*[-–/]\s*(\d{2})(?!\d)")
 # "2024" or "FY2024": a single year
 YEAR_RE = re.compile(r"(?<!\d)20\d{2}(?!\d)")
 
+INTENTS = {"lookup", "comparison", "forecast", "chart_or_image", "other"}
+
 
 class Retriever:
-    """Rewrites follow-up questions and finds the best chunks from the right reports."""
+    """Understands the question, finds the right chunks, and loads their exact pages."""
 
     def __init__(self):
-        self.rewrite_prompt = get_prompt_template("query_rewrite.jinja2")
+        self.analysis_prompt = get_prompt_template("query_analysis.jinja2")
 
-    async def rewrite_question(self, question: str, history: list[dict]) -> str:
-        """Turn a follow-up like 'ok 2026' into a complete standalone question."""
-        # First question of a chat: nothing to rewrite, so skip the LLM call
-        if not history:
-            return question
-
+    async def analyze_question(self, question: str, history: list[dict]) -> dict:
+        """Resolve follow-ups ('ok 2026') and detect what kind of answer is needed."""
+        fallback = {
+            "standalone_question": question,
+            "intent": "lookup",
+            "sub_queries": [],
+            "forecast_periods": [],
+        }
         recent = history[-settings.RETRIEVAL_HISTORY_MESSAGES :]
-        prompt = self.rewrite_prompt.render(history=recent, question=question)
+        prompt = self.analysis_prompt.render(history=recent, question=question)
 
         reply = ""
         try:
@@ -36,45 +41,75 @@ class Retriever:
                 json_mode=True,
                 max_tokens=settings.REWRITE_MAX_TOKENS,
             )
-            logger.info(f"Rewrite raw reply: {reply!r}")
-            standalone = json.loads(reply).get("standalone_question", "").strip()
+            logger.info(f"Analysis raw reply: {reply!r}")
+            data = json.loads(reply)
         except Exception as e:
-            # If rewrite fails, search with the original question instead of crashing
-            logger.error(f"Question rewrite failed ({e}), raw reply: {reply!r}")
-            return question
+            # If analysis fails, search with the original question instead of crashing
+            logger.error(f"Question analysis failed ({e}), raw reply: {reply!r}")
+            return fallback
 
-        if not standalone:
-            return question
+        standalone = (data.get("standalone_question") or "").strip() or question
+        intent = data.get("intent") if data.get("intent") in INTENTS else "lookup"
+        sub_queries = [q.strip() for q in data.get("sub_queries", []) if isinstance(q, str) and q.strip()]
+        periods = []
+        for p in data.get("forecast_periods", []):
+            try:
+                periods.append(int(p))
+            except (TypeError, ValueError):
+                continue
 
-        logger.info(f"Rewrote question: '{question}' -> '{standalone}'")
-        return standalone
+        logger.info(f"Analysis: '{question}' -> '{standalone}' intent={intent} subs={sub_queries}")
+        return {
+            "standalone_question": standalone,
+            "intent": intent,
+            "sub_queries": sub_queries,
+            "forecast_periods": periods,
+        }
 
     async def retrieve(self, question: str, history: list[dict] | None = None) -> dict:
-        """Rewrite the question, then search only the reports that match its years."""
-        standalone = await self.rewrite_question(question, history or [])
+        """Analyze the question, search the matching reports, and load the exact pages."""
+        analysis = await self.analyze_question(question, history or [])
+        standalone = analysis["standalone_question"]
 
-        vectors = await azure_openai_client.embed([standalone])
-        query_vector = vectors[0]
+        # The full question first, then one short query per year/metric (comparison, forecast)
+        queries = [standalone]
+        queries += [q for q in analysis["sub_queries"] if q != standalone]
+        queries = queries[: settings.RETRIEVAL_MAX_QUERIES]
 
-        reports = self._pick_reports(standalone)
-        logger.info(f"Searching reports: {reports}")
+        vectors = await azure_openai_client.embed(queries)
 
-        # One search per report, all at the same time
-        results = await asyncio.gather(
-            *[
-                ai_search_client.search(
-                    standalone,
-                    query_vector,
-                    top_k=settings.RETRIEVAL_PER_REPORT_K,
-                    filter=f"source_pdf eq '{pdf_name}'",
+        # One search per (query, report), all at the same time
+        searches = []
+        for i, (query, vector) in enumerate(zip(queries, vectors)):
+            top_k = settings.RETRIEVAL_PER_REPORT_K if i == 0 else settings.RETRIEVAL_SUBQUERY_K
+            for pdf_name in self._pick_reports(query):
+                searches.append(
+                    ai_search_client.search(
+                        query,
+                        vector,
+                        top_k=top_k,
+                        filter=f"source_pdf eq '{pdf_name}'",
+                    )
                 )
-                for pdf_name in reports
-            ]
-        )
+        logger.info(f"Running {len(searches)} searches for {len(queries)} queries")
+
+        raw = await asyncio.gather(*searches, return_exceptions=True)
+        results = [r for r in raw if not isinstance(r, Exception)]
+        for r in raw:
+            if isinstance(r, Exception):
+                logger.error(f"A search failed: {r}")
+        if not results:
+            raise RuntimeError("All searches failed")
 
         chunks = self._merge(results)
-        logger.info(f"Retrieved {len(chunks)} unique chunks for: {standalone}")
-        return {"question": standalone, "chunks": chunks}
+        pages = self._load_pages(chunks)
+        logger.info(f"Retrieved {len(chunks)} chunks -> {len(pages)} pages for: {standalone}")
+        return {
+            "question": standalone,
+            "analysis": analysis,
+            "chunks": chunks,
+            "pages": pages,
+        }
 
     def _find_years(self, question: str) -> set[int]:
         """Financial years (as the ending year) mentioned in the question."""
@@ -110,17 +145,39 @@ class Retriever:
         return [f for f in settings.REPORT_FILES if f in wanted]
 
     def _merge(self, result_lists: list[list[dict]]) -> list[dict]:
-        """Join all search results into one list and remove duplicates."""
+        """Join all search results (best hit of every list first) and remove duplicates."""
         seen = set()
         merged = []
-        for hits in result_lists:
-            for hit in hits:
+        longest = max((len(hits) for hits in result_lists), default=0)
+        for rank in range(longest):
+            for hits in result_lists:
+                if rank >= len(hits):
+                    continue
+                hit = hits[rank]
                 key = (hit["source_pdf"], hit["page_start"], hit["page_end"])
                 if key in seen:
                     continue
                 seen.add(key)
                 merged.append(hit)
         return merged
+
+    def _load_pages(self, chunks: list[dict]) -> list[dict]:
+        """Turn the retrieved chunks into the exact pages they cover, best chunk first."""
+        pages = []
+        seen = set()
+        for chunk in chunks:
+            for number in range(chunk["page_start"], chunk["page_end"] + 1):
+                key = (chunk["source_pdf"], number)
+                if key in seen:
+                    continue
+                text = page_store.get_page(chunk["source_pdf"], number)
+                if text is None:
+                    continue
+                seen.add(key)
+                pages.append({"source_pdf": chunk["source_pdf"], "page": number, "text": text})
+                if len(pages) >= settings.ANSWER_MAX_CONTEXT_PAGES:
+                    return pages
+        return pages
 
 
 retriever = Retriever()
