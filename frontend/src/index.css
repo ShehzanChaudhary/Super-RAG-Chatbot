@@ -7,15 +7,34 @@
   --color-brand-sky: #f5f8fd;
   --color-brand-blue: #2d8cf0;
   --color-brand-text: #4a4a4a;
+  --color-brand-cream: #fffaf4;
+  --color-brand-peach: #fbe3c8;
+  --color-panel: #f6f6f4;
 
-  --font-sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-sans: "Plus Jakarta Sans", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
 }
 
 @layer base {
+  html {
+    scroll-behavior: smooth;
+  }
   body {
     margin: 0;
     font-family: var(--font-sans);
     color: var(--color-brand-text);
     background: #ffffff;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-brand-blue);
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .animate-bounce {
+    animation: none;
   }
 }

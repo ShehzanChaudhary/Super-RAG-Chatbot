@@ -23,16 +23,18 @@ class Retriever:
         recent = history[-settings.RETRIEVAL_HISTORY_MESSAGES :]
         prompt = self.rewrite_prompt.render(history=recent, question=question)
 
+        reply = ""
         try:
             reply = await azure_openai_client.chat(
                 [{"role": "user", "content": prompt}],
                 json_mode=True,
                 max_tokens=200,
             )
+            logger.info(f"Rewrite raw reply: {reply!r}")
             standalone = json.loads(reply).get("standalone_question", "").strip()
         except Exception as e:
             # If rewrite fails, search with the original question instead of crashing
-            logger.error(f"Question rewrite failed, using original: {e}")
+            logger.error(f"Question rewrite failed ({e}), raw reply: {reply!r}")
             return question
 
         if not standalone:
