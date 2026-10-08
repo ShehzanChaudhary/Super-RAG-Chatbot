@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.logger.logger import logger
@@ -24,6 +24,18 @@ class ChatRepository:
             raise
 
         return chat
+
+    async def delete_chat(self, session: AsyncSession, chat: Chat) -> None:
+        """Delete a chat together with all its messages."""
+        try:
+            # Messages first, because messages.chat_id points to chats.id
+            await session.execute(delete(Message).where(Message.chat_id == chat.id))
+            await session.delete(chat)
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Could not delete chat {chat.id}: {e}")
+            raise
 
     async def list_chats(self, session: AsyncSession, user_id: int) -> list[Chat]:
         """All chats of one user, latest first (this is the sidebar list)."""

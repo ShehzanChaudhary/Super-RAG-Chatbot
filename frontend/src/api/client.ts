@@ -98,6 +98,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     handleUnauthorized(path, res.status);
     throw new ApiError(res.status, await readError(res));
   }
+  // DELETE returns 204 with an empty body, so there is no JSON to read
+  if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
 
@@ -125,6 +127,9 @@ export const api = {
   createChat: () => request<Chat>("/api/chats", { method: "POST" }),
 
   getChat: (chatId: number) => request<ChatDetail>(`/api/chats/${chatId}`),
+
+  deleteChat: (chatId: number) =>
+    request<void>(`/api/chats/${chatId}`, { method: "DELETE" }),
 };
 
 function parseEvent(block: string): StreamEvent | null {

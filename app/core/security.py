@@ -9,14 +9,8 @@ from app.core.config import settings
 
 BCRYPT_MAX_BYTES = 72
 
-
 class Security:
     """Password hashing and login tokens (JWT)."""
-
-    def __init__(self):
-        if settings.JWT_SECRET_KEY == "change-me":
-            logger.warning("JWT_SECRET_KEY is the default value, set a real one in .env")
-
     async def hash_password(self, password: str) -> str:
         """Turn a password into a hash that is safe to store."""
         # bcrypt is slow on purpose, so run it in a thread to keep the app responsive

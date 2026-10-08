@@ -22,18 +22,21 @@ class Settings(BaseSettings):
     CHAT_MODEL: str = "openai/gpt-4o-mini"      # answers, routing, rewriting
     VISION_MODEL: str = "openai/gpt-4o"         # reads charts/tables at ingestion
     EMBEDDING_MODEL: str = "openai/text-embedding-3-large"
-    EMBEDDING_DIMENSIONS: int = 1536
-
+    
     """AI Search (Vector Store)"""
     SEARCH_ENDPOINT: str = ""
     SEARCH_API_KEY: str = ""
     SEARCH_INDEX_NAME: str = "rag-assistant-bot"
 
     """Retrieval"""
-    RETRIEVAL_TOP_K: int = 8
-    RETRIEVAL_TABLE_K: int = 4
-    RETRIEVAL_CHART_K: int = 3
+    PAGES_DIR: Path = PROJECT_ROOT / "output" / "pages"
+    METADATA_DIR: Path = PROJECT_ROOT / "output" / "metadata"
+    RETRIEVAL_CHUNKS_PER_QUERY: int = 5
+    RETRIEVAL_PAGES_PER_REPORT: int = 4
+    RETRIEVAL_PAGES_FOCUS_REPORT: int = 6
+    EMBEDDING_DIMENSIONS:int = 3072
     RETRIEVAL_HISTORY_MESSAGES: int = 6
+    REWRITE_MAX_TOKENS: int = 4000
 
     REPORT_FILES: list[str] = [
     "Annual_Report_2021_22_1.pdf",
@@ -41,17 +44,16 @@ class Settings(BaseSettings):
     "Annual_Report_2023_24.pdf",
     ]
     RETRIEVAL_PER_REPORT_K: int = 4
-    REWRITE_MAX_TOKENS: int = 800
 
     """Answer"""
-    ANSWER_MAX_TOKENS: int = 1500
+    ANSWER_MAX_TOKENS: int = 6000
     DOCUMENTS_URL: str = "/api/documents"
 
     """Database"""
     DATABASE_URL: str = "sqlite+aiosqlite:///./rag_bot.db"
 
     """Auth"""
-    JWT_SECRET_KEY: str = "change-me"
+    JWT_SECRET_KEY: str = ""
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
@@ -61,8 +63,8 @@ class Settings(BaseSettings):
     """Azure OpenAI"""
     AZURE_OPENAI_ENDPOINT: str = ""
     AZURE_OPENAI_API_KEY: str = ""
-    AZURE_OPENAI_CHAT_DEPLOYMENT: str = ""       # your gpt-4.1-mini deployment name
-    AZURE_OPENAI_VISION_DEPLOYMENT: str = ""     # empty = use the chat deployment
+    AZURE_OPENAI_CHAT_DEPLOYMENT: str = ""       
+    AZURE_OPENAI_VISION_DEPLOYMENT: str = ""     
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT: str = ""
 
     model_config = SettingsConfigDict(

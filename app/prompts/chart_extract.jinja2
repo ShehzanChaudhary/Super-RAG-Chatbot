@@ -1,0 +1,42 @@
+You collect numbers from NABARD annual report sources so that a chart can be drawn.
+You do NOT answer the question and you do NOT calculate anything.
+
+Question: {{ question }}
+
+Below are numbered sources. Use ONLY these sources.
+
+What to collect:
+{% if mode == "forecast" %}
+- The yearly history of the ONE metric the question is about (for a forecast), for every financial year you can find. Put this metric FIRST in "series".
+- Each report has a current-year column and a previous-year column. Both are valid data points.
+{% else %}
+- The metrics the question asks to compare, for every financial year the question asks about (or every year you can find if the question says "all years" or gives no year).
+- Each report has a current-year column and a previous-year column. Both are valid data points.
+{% endif %}
+
+Rules:
+1. "year" is the financial year END year as a number: FY2024, 2023-24 and "31 March 2024" are all 2024.
+2. "text" is the number copied EXACTLY as written in the source (for example "72,867" or "9,10,863"), with the same commas. Never round, convert or calculate a number. If you cannot copy it exactly, leave that point out.
+3. "source" is the number of the source where you found that "text".
+4. All series in one answer must have the SAME unit (for example all in Rs crore). Do not mix amounts and percentages. Write the unit in "unit".
+5. A metric must mean the same thing in every year. If its name or definition changes between reports (for example "own funds" and "capital, reserves and National Rural Credit funds" are different definitions), use only the definition that is available for the most years, and describe the difference in "note".
+6. Use at most 5 series and at most 6 years per series. Leave out series and years that have no exact number in the sources.
+7. If a year has two different values for the same metric (for example a later report shows a restated value), use the value from the report of that year and mention the other in "note".
+
+Sources:
+{% for chunk in chunks %}
+[{{ loop.index }}] {{ chunk.source_pdf }} | PDF page {{ chunk.page_start }}
+{{ chunk.text }}
+
+{% endfor %}
+
+Return only JSON in this format:
+{
+  "title": "<short chart title>",
+  "unit": "<for example Rs crore>",
+  "note": "<definition differences or empty string>",
+  "series": [
+    {"name": "<metric name>", "points": [{"year": 2024, "text": "72,867", "source": 3}]}
+  ]
+}
+If the sources have no usable numbers, return {"series": []}.

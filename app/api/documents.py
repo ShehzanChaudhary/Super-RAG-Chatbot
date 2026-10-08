@@ -9,10 +9,8 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 @router.get("/{doc_name}")
 async def get_document(doc_name: str):
-    """Send a PDF from the docs folder. Public, as decided."""
+    """Send a PDF from the docs folder: Public"""
     # Only PDFs that really exist in the docs folder can be opened.
-    # We look the name up in this list, we never build a path from user input,
-    # so things like ../.env cannot work.
     available = {path.name: path for path in settings.PDF_DIR.glob("*.pdf")}
 
     path = available.get(doc_name)

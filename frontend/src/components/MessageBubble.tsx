@@ -36,18 +36,25 @@ interface MessageBubbleProps {
 interface ChartSpec {
   type: "bar" | "line";
   title?: string;
-  xKey: string;
-  series: { key: string; name?: string }[];
-  data: Record<string, string | number>[];
+  unit?: string;
+  note?: string;
+  labels: string[];
+  series: { name: string; values: (number | null)[]; dashed?: boolean }[];
 }
 
 const CHART_COLORS = ["#173a66", "#9e2a2b", "#2d8cf0", "#d99a2b", "#3f9b6b"];
+
+// Indian grouping, same as the reports (910863 -> 9,10,863)
+function formatIndian(value: number | string | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "-";
+  return Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+}
 
 function ChartBlock({ raw, streaming }: { raw: string; streaming: boolean }) {
   let spec: ChartSpec | null = null;
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && Array.isArray(parsed.data) && Array.isArray(parsed.series) && parsed.xKey) {
+    if (parsed && Array.isArray(parsed.labels) && Array.isArray(parsed.series)) {
       spec = parsed as ChartSpec;
     }
   } catch {
@@ -62,39 +69,51 @@ function ChartBlock({ raw, streaming }: { raw: string; streaming: boolean }) {
     );
   }
 
+  // Backend format (labels + values per series) -> rows for recharts
+  const data = spec.labels.map((label, i) => {
+    const row: Record<string, string | number | null> = { label };
+    spec.series.forEach((s, j) => {
+      row[`s${j}`] = s.values[i] ?? null;
+    });
+    return row;
+  });
+
   const Chart = spec.type === "line" ? LineChart : BarChart;
 
   return (
     <figure className="my-4 rounded-xl border border-gray-200 bg-white p-3">
-      {spec.title && (
+      {(spec.title || spec.unit) && (
         <figcaption className="mb-2 px-1 text-sm font-semibold text-brand-navy">
           {spec.title}
+          {spec.unit ? ` (${spec.unit})` : ""}
         </figcaption>
       )}
       <div className="h-72 w-full">
         <ResponsiveContainer>
-          <Chart data={spec.data} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
+          <Chart data={data} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-            <XAxis dataKey={spec.xKey} tick={{ fontSize: 12 }} />
-            <YAxis tick={{ fontSize: 12 }} width={64} />
-            <Tooltip />
+            <XAxis dataKey="label" tick={{ fontSize: 12 }} />
+            <YAxis tick={{ fontSize: 12 }} width={80} tickFormatter={formatIndian} />
+            <Tooltip formatter={(value) => formatIndian(value as number)} />
             {spec.series.length > 1 && <Legend />}
             {spec.series.map((s, i) =>
               spec.type === "line" ? (
                 <Line
-                  key={s.key}
-                  type="monotone"
-                  dataKey={s.key}
-                  name={s.name ?? s.key}
+                  key={i}
+                  type="linear"
+                  dataKey={`s${i}`}
+                  name={s.name}
                   stroke={CHART_COLORS[i % CHART_COLORS.length]}
                   strokeWidth={2.5}
+                  strokeDasharray={s.dashed ? "6 4" : undefined}
                   dot={{ r: 3 }}
+                  connectNulls={false}
                 />
               ) : (
                 <Bar
-                  key={s.key}
-                  dataKey={s.key}
-                  name={s.name ?? s.key}
+                  key={i}
+                  dataKey={`s${i}`}
+                  name={s.name}
                   fill={CHART_COLORS[i % CHART_COLORS.length]}
                   radius={[4, 4, 0, 0]}
                 />
@@ -103,6 +122,7 @@ function ChartBlock({ raw, streaming }: { raw: string; streaming: boolean }) {
           </Chart>
         </ResponsiveContainer>
       </div>
+      {spec.note && <p className="mt-2 px-1 text-xs text-gray-500">{spec.note}</p>}
     </figure>
   );
 }

@@ -15,9 +15,19 @@ Rules:
 9. Never write source numbers like [1] or "source 2" inside the answer text. The answer is shown to the user while you write it, and the citations are added separately.
 10. The very last line of your reply must be "SOURCES:" followed by the numbers of the sources you actually used, separated by commas (for example "SOURCES: 1, 3"). Write nothing after this line.
 
+{% if images %}
+Chart images are attached to this message, in this order:
+{% for image in images %}
+Image {{ loop.index }}: {{ image.source_pdf }}, PDF page {{ image.page }}
+{% endfor %}
+Use them to read chart values when the text description of a chart is missing or unclear.
+If an image and its text description disagree, trust the image and say so.
+Always say clearly when a value was read from an image.
+
+{% endif %}
 Sources:
 {% for chunk in chunks %}
-[{{ loop.index }}] {{ chunk.source_pdf }} | PDF pages {{ chunk.page_start }} to {{ chunk.page_end }}
+[{{ loop.index }}] {{ chunk.source_pdf }} | PDF page {{ chunk.page_start }}
 {{ chunk.text }}
 
 {% endfor %}

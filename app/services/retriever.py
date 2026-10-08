@@ -1,183 +1,360 @@
 import asyncio
 import json
+import math
 import re
+from collections import Counter
 
 from app.adapters.llm.azure_openai_client import azure_openai_client
 from app.adapters.logger.logger import logger
 from app.adapters.search.ai_search_client import ai_search_client
-from app.core.config import settings
+from app.core.config import PROJECT_ROOT, settings
 from app.prompts import get_prompt_template
-from app.services.page_store import page_store
 
-# "2023-24" or "2023/24": a financial year written as a range
-YEAR_RANGE_RE = re.compile(r"(?<!\d)(20\d{2})\s*[-–/]\s*(\d{2})(?!\d)")
-# "2024" or "FY2024": a single year
-YEAR_RE = re.compile(r"(?<!\d)20\d{2}(?!\d)")
+# Financial year (end year) -> report that contains it.
+# FY2021 numbers are in the 2021-22 report (as last year's column).
+REPORT_FILES = settings.REPORT_FILES
+YEAR_TO_REPORT = {
+    2021: REPORT_FILES[0],
+    2022: REPORT_FILES[0],
+    2023: REPORT_FILES[1],
+    2024: REPORT_FILES[2],
+}
 
-INTENTS = {"lookup", "comparison", "forecast", "chart_or_image", "other"}
+# Matches 2024, FY2024, 2023-24, 2022-2024
+YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?:\s*[-–/]\s*(\d{2,4}))?(?!\d)")
+
+# Words that tell us the question needs data from all the reports
+WIDE_QUESTION_RE = re.compile(
+    r"\b(compare|comparison|versus|vs|trend|growth|change|forecast|predict|prediction|"
+    r"projection|project|estimate|expected|future|next year|over the years|yoy|cagr|"
+    r"increase|decrease|all years|three years|3 years)\b",
+    re.IGNORECASE,
+)
+
+IMAGE_ID_RE = re.compile(r"\[IMAGE id=(\S+) page=")
+IMAGE_FILE_RE = re.compile(r" file=\S+\]")  # the saved-file path is useless for the LLM
+
+STOP_WORDS = {
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are", "was",
+    "were", "be", "been", "what", "which", "who", "how", "much", "many", "me", "tell", "give",
+    "show", "please", "about", "with", "from", "by", "as", "it", "its", "this", "that", "do",
+    "does", "did", "can", "you", "i", "my", "ok", "okay", "also", "then", "than", "total",
+}
+
+RRF_K = 60  # standard constant for rank fusion
+PAGE_EMBED_CHARS = 12000  # a page is cut to this size before embedding (model token limit)
+HISTORY_CONTENT_CHARS = 600  # old bot answers are cut to this size in the rewrite prompt
+
+
+def find_years(text: str) -> set[int]:
+    """All financial years mentioned in the text. '2023-24' means FY2024."""
+    years = set()
+    for match in YEAR_RE.finditer(text):
+        start = int(match.group(1))
+        second = match.group(2)
+        if second is None:
+            years.add(start)
+            continue
+        end = int(second) if len(second) == 4 else int(str(start)[:2] + second)
+        if end == start + 1:
+            years.add(end)
+        else:
+            years.update({start, end})
+    return years
+
+
+def tokenize(text: str) -> list[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return [w for w in words if w not in STOP_WORDS and len(w) > 1]
+
+
+def rank_positions(scores: dict) -> dict:
+    """{key: score} -> {key: position}, best score gets position 0."""
+    ordered = sorted(scores, key=scores.get, reverse=True)
+    return {key: position for position, key in enumerate(ordered)}
+
+
+def dot(a: list[float], b: list[float]) -> float:
+    # OpenAI embeddings are unit length, so dot product = cosine similarity
+    return sum(x * y for x, y in zip(a, b))
 
 
 class Retriever:
-    """Understands the question, finds the right chunks, and loads their exact pages."""
+    """Finds the pages of the reports that can answer a question.
+
+    Steps: rewrite follow-up -> search every report -> split chunks into pages
+    -> pick the best pages of every report (exact page = exact citation).
+    """
 
     def __init__(self):
-        self.analysis_prompt = get_prompt_template("query_analysis.jinja2")
+        self.pages: dict[tuple[str, int], str] = {}  # (pdf, page) -> page text
+        self.page_terms: dict[tuple[str, int], Counter] = {}
+        self.doc_freq: Counter = Counter()
+        self.page_vectors: dict[tuple[str, int], list[float]] = {}  # filled on demand
+        self.image_paths: dict[str, str] = {}  # image id -> saved png path
 
-    async def analyze_question(self, question: str, history: list[dict]) -> dict:
-        """Resolve follow-ups ('ok 2026') and detect what kind of answer is needed."""
-        fallback = {
-            "standalone_question": question,
-            "intent": "lookup",
-            "sub_queries": [],
-            "forecast_periods": [],
-        }
-        recent = history[-settings.RETRIEVAL_HISTORY_MESSAGES :]
-        prompt = self.analysis_prompt.render(history=recent, question=question)
+        self.load_pages()
+        self.load_image_paths()
 
-        reply = ""
-        try:
-            reply = await azure_openai_client.chat(
-                [{"role": "user", "content": prompt}],
-                json_mode=True,
-                max_tokens=settings.REWRITE_MAX_TOKENS,
+    # ---------- Loading local files (once, at startup) ----------
+
+    def load_pages(self):
+        """Read output/pages/*_pages.jsonl (one line per PDF page)."""
+        for path in sorted(settings.PAGES_DIR.glob("*_pages.jsonl")):
+            pdf = path.name.removesuffix("_pages.jsonl") + ".pdf"
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                key = (pdf, row["page_number"])
+                terms = Counter(tokenize(row["text"]))
+                self.pages[key] = row["text"]
+                self.page_terms[key] = terms
+                self.doc_freq.update(terms.keys())
+
+        if self.pages:
+            logger.info(f"Retriever loaded {len(self.pages)} pages")
+        else:
+            logger.warning(f"No page files found in {settings.PAGES_DIR}; using chunk-level results")
+
+    def load_image_paths(self):
+        """Read output/metadata/*_images.jsonl so we can say where each figure is saved."""
+        for path in sorted(settings.METADATA_DIR.glob("*_images.jsonl")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                saved = PROJECT_ROOT / row["image_path"].replace("\\", "/")
+                self.image_paths[row["image_id"]] = str(saved)
+        logger.info(f"Retriever knows {len(self.image_paths)} figure images")
+
+    # ---------- Step 1: follow-up question -> standalone question ----------
+
+    async def rewrite_question(self, question: str, history: list[dict]) -> str:
+        if not history:
+            return question  # first question, nothing to resolve
+
+        recent = []
+        for message in history[-settings.RETRIEVAL_HISTORY_MESSAGES:]:
+            recent.append(
+                {"role": message["role"], "content": message["content"][:HISTORY_CONTENT_CHARS]}
             )
-            logger.info(f"Analysis raw reply: {reply!r}")
-            data = json.loads(reply)
-        except Exception as e:
-            # If analysis fails, search with the original question instead of crashing
-            logger.error(f"Question analysis failed ({e}), raw reply: {reply!r}")
-            return fallback
 
-        standalone = (data.get("standalone_question") or "").strip() or question
-        intent = data.get("intent") if data.get("intent") in INTENTS else "lookup"
-        sub_queries = [q.strip() for q in data.get("sub_queries", []) if isinstance(q, str) and q.strip()]
-        periods = []
-        for p in data.get("forecast_periods", []):
+        prompt = get_prompt_template("query_rewrite.jinja2").render(history=recent, question=question)
+        raw = ""
+        for attempt in range(2):
             try:
-                periods.append(int(p))
-            except (TypeError, ValueError):
-                continue
-
-        logger.info(f"Analysis: '{question}' -> '{standalone}' intent={intent} subs={sub_queries}")
-        return {
-            "standalone_question": standalone,
-            "intent": intent,
-            "sub_queries": sub_queries,
-            "forecast_periods": periods,
-        }
-
-    async def retrieve(self, question: str, history: list[dict] | None = None) -> dict:
-        """Analyze the question, search the matching reports, and load the exact pages."""
-        analysis = await self.analyze_question(question, history or [])
-        standalone = analysis["standalone_question"]
-
-        # The full question first, then one short query per year/metric (comparison, forecast)
-        queries = [standalone]
-        queries += [q for q in analysis["sub_queries"] if q != standalone]
-        queries = queries[: settings.RETRIEVAL_MAX_QUERIES]
-
-        vectors = await azure_openai_client.embed(queries)
-
-        # One search per (query, report), all at the same time
-        searches = []
-        for i, (query, vector) in enumerate(zip(queries, vectors)):
-            top_k = settings.RETRIEVAL_PER_REPORT_K if i == 0 else settings.RETRIEVAL_SUBQUERY_K
-            for pdf_name in self._pick_reports(query):
-                searches.append(
-                    ai_search_client.search(
-                        query,
-                        vector,
-                        top_k=top_k,
-                        filter=f"source_pdf eq '{pdf_name}'",
-                    )
+                raw = await azure_openai_client.chat(
+                    [{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    max_tokens=settings.REWRITE_MAX_TOKENS,
                 )
-        logger.info(f"Running {len(searches)} searches for {len(queries)} queries")
+                standalone = self.parse_rewrite(raw)
+                if standalone:
+                    logger.info(f"Question rewritten: '{question}' -> '{standalone}'")
+                    return standalone
+            except Exception as e:
+                logger.error(f"Rewrite call failed (attempt {attempt + 1}): {e}")
+            logger.warning(f"Rewrite attempt {attempt + 1} gave no usable question. Raw reply: {raw!r}")
 
-        raw = await asyncio.gather(*searches, return_exceptions=True)
-        results = [r for r in raw if not isinstance(r, Exception)]
-        for r in raw:
-            if isinstance(r, Exception):
-                logger.error(f"A search failed: {r}")
-        if not results:
-            raise RuntimeError("All searches failed")
+        return self.fallback_question(question, history)
 
-        chunks = self._merge(results)
-        pages = self._load_pages(chunks)
-        logger.info(f"Retrieved {len(chunks)} chunks -> {len(pages)} pages for: {standalone}")
-        return {
-            "question": standalone,
-            "analysis": analysis,
-            "chunks": chunks,
-            "pages": pages,
-        }
+    @staticmethod
+    def parse_rewrite(raw: str) -> str | None:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            standalone = json.loads(match.group(0)).get("standalone_question")
+        except json.JSONDecodeError:
+            return None
+        if isinstance(standalone, str) and 0 < len(standalone.strip()) <= 600:
+            return standalone.strip()
+        return None
 
-    def _find_years(self, question: str) -> set[int]:
-        """Financial years (as the ending year) mentioned in the question."""
-        years = set()
-        # "2023-24" means FY2024
-        for start, end in YEAR_RANGE_RE.findall(question):
-            years.add(int(start[:2] + end))
-        # take the ranges out first, so "2023-24" is not also read as 2023
-        rest = YEAR_RANGE_RE.sub(" ", question)
-        for year in YEAR_RE.findall(rest):
-            years.add(int(year))
-        return years
+    @staticmethod
+    def fallback_question(question: str, history: list[dict]) -> str:
+        """Used only when the rewrite fails: a short follow-up gets the last user question in front."""
+        if len(question.split()) > 6:
+            return question
+        for message in reversed(history):
+            if message["role"] == "user":
+                return f"{message['content']} ({question})"
+        return question
 
-    def _pick_reports(self, question: str) -> list[str]:
-        """Choose which report files to search, based on the years in the question."""
-        years = self._find_years(question)
-        if not years:
-            return settings.REPORT_FILES
+    # ---------- Step 2: which reports matter most ----------
 
-        wanted = set()
-        for year in years:
-            # The report of that year, and the next year's report
-            # (it repeats the previous year's numbers as comparison)
-            for fy in (year, year + 1):
-                tag = f"{fy - 1}_{str(fy)[2:]}"  # FY2024 -> "2023_24"
-                wanted.update(f for f in settings.REPORT_FILES if tag in f)
+    @staticmethod
+    def pick_focus_reports(question: str, years: set[int]) -> set[str]:
+        """Reports that get more pages. Every report is still searched."""
+        all_reports = set(REPORT_FILES)
 
-        # Years with no report (for example a forecast year): search everything
-        if not wanted:
-            return settings.REPORT_FILES
+        if len(years) != 1:  # no year, or several years (comparison)
+            return all_reports
+        if not years.issubset(YEAR_TO_REPORT):  # future year (forecast) or very old year
+            return all_reports
+        if WIDE_QUESTION_RE.search(question):
+            return all_reports
 
-        # keep the same order as REPORT_FILES
-        return [f for f in settings.REPORT_FILES if f in wanted]
+        return {YEAR_TO_REPORT[year] for year in years}
 
-    def _merge(self, result_lists: list[list[dict]]) -> list[dict]:
-        """Join all search results (best hit of every list first) and remove duplicates."""
-        seen = set()
-        merged = []
-        longest = max((len(hits) for hits in result_lists), default=0)
-        for rank in range(longest):
+    # ---------- Step 3: search one report ----------
+
+    @staticmethod
+    def build_queries(question: str) -> list[str]:
+        """The question itself, and the same question without years (report is already filtered)."""
+        queries = [question]
+        without_years = re.sub(r"\bFY\s*", "", YEAR_RE.sub(" ", question), flags=re.IGNORECASE)
+        without_years = re.sub(r"\s+", " ", without_years).strip()
+        if len(without_years.split()) >= 3 and without_years != question:
+            queries.append(without_years)
+        return queries
+
+    async def search_report(self, report: str, queries: list[str], vectors: list[list[float]]) -> list[dict]:
+        """Hybrid search inside one report. Returns unique chunks, best first."""
+        report_filter = f"source_pdf eq '{report}'"
+        result_lists = await asyncio.gather(
+            *[
+                ai_search_client.search(
+                    query, vector, top_k=settings.RETRIEVAL_CHUNKS_PER_QUERY, filter=report_filter
+                )
+                for query, vector in zip(queries, vectors)
+            ]
+        )
+
+        merged, seen = [], set()
+        longest = max(len(hits) for hits in result_lists)
+        for position in range(longest):  # take rank 1 of every query, then rank 2, ...
             for hits in result_lists:
-                if rank >= len(hits):
-                    continue
-                hit = hits[rank]
-                key = (hit["source_pdf"], hit["page_start"], hit["page_end"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(hit)
+                if position < len(hits):
+                    hit = hits[position]
+                    chunk_key = (hit["page_start"], hit["page_end"])
+                    if chunk_key not in seen:
+                        seen.add(chunk_key)
+                        merged.append(hit)
         return merged
 
-    def _load_pages(self, chunks: list[dict]) -> list[dict]:
-        """Turn the retrieved chunks into the exact pages they cover, best chunk first."""
-        pages = []
-        seen = set()
-        for chunk in chunks:
-            for number in range(chunk["page_start"], chunk["page_end"] + 1):
-                key = (chunk["source_pdf"], number)
-                if key in seen:
-                    continue
-                text = page_store.get_page(chunk["source_pdf"], number)
-                if text is None:
-                    continue
-                seen.add(key)
-                pages.append({"source_pdf": chunk["source_pdf"], "page": number, "text": text})
-                if len(pages) >= settings.ANSWER_MAX_CONTEXT_PAGES:
-                    return pages
-        return pages
+    # ---------- Step 4: chunks -> best pages ----------
+
+    def keyword_score(self, key: tuple[str, int], query_terms: set[str]) -> float:
+        counts = self.page_terms[key]
+        total_pages = len(self.pages)
+        score = 0.0
+        for term in query_terms:
+            tf = counts.get(term, 0)
+            if tf:
+                df = self.doc_freq[term]
+                idf = math.log(1 + (total_pages - df + 0.5) / (df + 0.5))
+                score += idf * tf / (tf + 1.2)
+        return score
+
+    async def embed_missing_pages(self, keys: list[tuple[str, int]]):
+        """Embed pages we have not seen before. Vectors are kept, so each page is embedded once."""
+        missing = [key for key in keys if key not in self.page_vectors]
+        if not missing:
+            return
+        vectors = await azure_openai_client.embed([self.pages[key][:PAGE_EMBED_CHARS] for key in missing])
+        for key, vector in zip(missing, vectors):
+            self.page_vectors[key] = vector
+
+    async def pick_pages(
+        self,
+        report: str,
+        chunks: list[dict],
+        query_vector: list[float],
+        query_terms: set[str],
+        how_many: int,
+    ) -> list[tuple[tuple[str, int], float]]:
+        """The best pages of one report, as [((pdf, page), score)]."""
+        chunk_rank: dict[tuple[str, int], int] = {}  # page -> rank of the best chunk holding it
+        for rank, chunk in enumerate(chunks):
+            for page in range(chunk["page_start"], chunk["page_end"] + 1):
+                key = (report, page)
+                if key in self.pages and key not in chunk_rank:
+                    chunk_rank[key] = rank
+
+        candidates = list(chunk_rank)
+        if not candidates:
+            return []
+
+        keyword_scores = {key: self.keyword_score(key, query_terms) for key in candidates}
+
+        try:
+            await self.embed_missing_pages(candidates)
+            vector_scores = {key: dot(query_vector, self.page_vectors[key]) for key in candidates}
+        except Exception as e:
+            logger.error(f"Page embedding failed, using keyword + chunk rank only: {e}")
+            vector_scores = {key: 0.0 for key in candidates}
+
+        keyword_rank = rank_positions(keyword_scores)
+        vector_rank = rank_positions(vector_scores)
+
+        final = {}
+        for key in candidates:
+            final[key] = (
+                1 / (RRF_K + vector_rank[key])
+                + 1 / (RRF_K + keyword_rank[key])
+                + 1 / (RRF_K + chunk_rank[key])
+            )
+
+        best = sorted(final, key=final.get, reverse=True)[:how_many]
+        return [(key, final[key]) for key in best]
+
+    def page_to_chunk(self, key: tuple[str, int], score: float) -> dict:
+        pdf, page = key
+        text = IMAGE_FILE_RE.sub("]", self.pages[key])
+        image_ids = IMAGE_ID_RE.findall(text)
+        return {
+            "source_pdf": pdf,
+            "page_start": page,
+            "page_end": page,
+            "text": text,
+            "image_ids": image_ids,
+            "images": [
+                {"image_id": image_id, "path": self.image_paths[image_id]}
+                for image_id in image_ids
+                if image_id in self.image_paths
+            ],
+            "score": score,
+        }
+
+    # ---------- The one function the API calls ----------
+
+    async def retrieve(self, question: str, history: list[dict] | None = None) -> dict:
+        """Returns {"question": standalone question, "chunks": [one chunk per PDF page]}."""
+        standalone = await self.rewrite_question(question, history or [])
+        years = find_years(standalone)
+        focus = self.pick_focus_reports(standalone, years)
+        logger.info(f"Years found: {sorted(years)} | focus reports: {sorted(focus)}")
+
+        queries = self.build_queries(standalone)
+        vectors = await azure_openai_client.embed(queries)
+        query_terms = set(tokenize(standalone))
+
+        # Every report is searched, so every report is represented in the answer
+        per_report_chunks = await asyncio.gather(
+            *[self.search_report(report, queries, vectors) for report in REPORT_FILES]
+        )
+
+        result = []
+        for report, chunks in zip(REPORT_FILES, per_report_chunks):
+            if not self.pages:
+                result.extend(chunks)  # no page files: fall back to whole chunks
+                continue
+
+            how_many = (
+                settings.RETRIEVAL_PAGES_FOCUS_REPORT
+                if report in focus
+                else settings.RETRIEVAL_PAGES_PER_REPORT
+            )
+            picked = await self.pick_pages(report, chunks, vectors[0], query_terms, how_many)
+            # Pages of one report are shown in page order
+            for key, score in sorted(picked, key=lambda item: item[0][1]):
+                result.append(self.page_to_chunk(key, score))
+
+        pages = ", ".join(f"{c['source_pdf'][14:21]} p{c['page_start']}" for c in result)
+        logger.info(f"Retrieved {len(result)} pages: {pages}")
+        return {"question": standalone, "chunks": result}
 
 
 retriever = Retriever()

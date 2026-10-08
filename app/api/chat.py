@@ -1,7 +1,7 @@
 import json
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +21,7 @@ from app.services.retriever import retriever
 
 router = APIRouter(prefix="/api/chats", tags=["chats"])
 
-ERROR_MESSAGE = "Jawab banate waqt error aaya. Dobara try karo."
+ERROR_MESSAGE = "Error while generating the response. Try Again!."
 
 
 def sse(event: str, data: dict) -> str:
@@ -96,6 +96,16 @@ async def create_chat(
     """Start a new empty chat."""
     return await chat_repository.create_chat(session, current_user.id)
 
+@router.delete("/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(database.get_session),
+):
+    """Delete a chat of this user, together with all its messages."""
+    chat = await get_chat_or_404(session, chat_id, current_user.id)
+    await chat_repository.delete_chat(session, chat)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.get("", response_model=list[ChatResponse])
 async def list_chats(

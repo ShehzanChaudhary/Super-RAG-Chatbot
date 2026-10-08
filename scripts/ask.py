@@ -28,7 +28,7 @@ async def main():
             reply = await answer_service.answer(result["question"], result["chunks"])
 
             print(f"\n[Rewritten question] {result['question']}")
-            pages = [f"{c['chunk_type']} p{c['pdf_page']}" for c in result["chunks"]]
+            pages = [f"{c['source_pdf']} p{c['page_start']}" for c in result["chunks"]]
             print(f"[Retrieved] {', '.join(pages)}\n")
 
             print(f"Bot: {reply['answer']}\n")
