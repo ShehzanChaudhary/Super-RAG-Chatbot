@@ -277,11 +277,11 @@ class AnswerService:
             if rest:
                 yield {"type": "token", "text": rest}
 
-            # Images related to the question (only from the cited pages)
-            figures = self.figure_block(question, result["answer"], chunks, result["citations"])
-            if figures:
-                yield {"type": "token", "text": figures}
-                result["answer"] += figures
+            # # Images related to the question (only from the cited pages)
+            # figures = self.figure_block(question, result["answer"], chunks, result["citations"])
+            # if figures:
+            #     yield {"type": "token", "text": figures}
+            #     result["answer"] += figures
 
             # Comparison: the chart is added after the text answer. A chart failure never breaks the answer.
             if intent == "comparison" and result["found"]:

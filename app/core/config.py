@@ -14,8 +14,7 @@ class Settings(BaseSettings):
 
     """Paths"""
     PDF_DIR: Path = PROJECT_ROOT / "docs"
-    DATA_DIR: Path = PROJECT_ROOT / "data"
-
+    
     """OpenRouter (LLM)"""
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"

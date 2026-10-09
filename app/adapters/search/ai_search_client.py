@@ -10,7 +10,7 @@ SELECT_FIELDS = ["source_pdf", "page_start", "page_end", "text", "image_ids"]
 
 
 class AISearchClient:
-    """Search on the AI Search index (the index is created by the notebook)"""
+    """Search on the AI Search index"""
 
     def __init__(self):
         self.search_client = SearchClient(
